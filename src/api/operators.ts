@@ -304,21 +304,12 @@ router.post("/launch-game", isAuthenticated, async (req, res) => {
       return;
     }
 
-    let user;
-    if (role == "user" || role == "admin") {
-      user = await getProfile(id);
-      console.log(user, "user");
-      
-    } else {
-      // Admin: use test admin account (ID 34) but use admin's actual email for tracking
-      // The game provider requires a specific test admin account
-      const adminEmail = req["token"].email || "admin@ok777.com";
-      user = {
-        id: 34, // Test admin account required by game provider
-        name: adminEmail.split("@")[0] || "admin", // Use email prefix as name for tracking
-        email: adminEmail,
-      };
-    }
+      let user =
+        role == "user"
+          ? await getProfile(id)
+          : { id: 34, name: "admin", email: "email" };
+
+    console.log(user, "user");
 
     const request_time = Math.floor(Date.now() / 1000);
 
@@ -358,11 +349,11 @@ router.post("/launch-game", isAuthenticated, async (req, res) => {
         message: response.data.message,
       });
     }
-  } catch (err: any) {
-    console.error("Launch game error:", err.response?.data || err.message);
+  } catch (err) {
+    console.error("Launch game error:", err.response.data);
     return res.status(500).json({
       success: false,
-      message: err.response?.data?.message || err.message || "Internal server error",
+      message: "Internal server error",
     });
   }
 });
