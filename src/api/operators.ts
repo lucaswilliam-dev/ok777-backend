@@ -3,7 +3,7 @@ import { listWagers, getWager, saveProductsBulk } from "../db/operators";
 import { verifyRequest, generateLaunchGameSign } from "../utils/gsc";
 import isAuthenticated, { isAdmin } from "../utils/jwt";
 import { getProfile } from "../db/users";
-// Removed Prisma usage; DB access should use pg pool via db modules
+import prisma from "../db/prisma";
 import { getAllProducts } from "../db/games";
 import {
   getAllGames,
@@ -271,69 +271,162 @@ router.get("/provider-games", async (req, res) => {
 
 router.post("/launch-game", isAuthenticated, async (req, res) => {
   try {
-    let id = req["token"].id;
-    let role = req["token"].role;
+    // Validate environment variables
+    if (!OPERATOR_CODE || !SECRET_KEY) {
+      console.error(
+        "Missing required environment variables: OPERATOR_CODE or SECRET_KEY"
+      );
+      return res.status(500).json({
+        success: false,
+        message: "Server configuration error",
+        code: 500,
+      });
+    }
+
+    const id = req["token"].id;
+    const role = req["token"].role;
 
     const {
       product_code,
       game_type,
-      currency,
+      currency = "IDR", // Default to IDR if not provided
       game_code,
       language_code = 0,
     } = req.body || {};
 
+    // Input validation
     if (!product_code) {
-      res.status(400).send({
-        message: "product_code parametr required",
+      return res.status(400).json({
+        success: false,
+        message: "product_code parameter required",
         code: 400,
       });
-      return;
     }
     if (!game_type) {
-      res.status(400).send({
+      return res.status(400).json({
+        success: false,
         message: "game_type parameter required",
         code: 400,
       });
-      return;
     }
     if (!game_code) {
-      res.status(400).send({
-        message: "game_code parametr required",
+      return res.status(400).json({
+        success: false,
+        message: "game_code parameter required",
         code: 400,
       });
-      return;
     }
 
-      let user =
-        role == "user"
-          ? await getProfile(id)
-          : { id: 34, name: "admin", email: "email" };
+    // Validate product_code is a number
+    if (isNaN(Number(product_code))) {
+      return res.status(400).json({
+        success: false,
+        message: "product_code must be a valid number",
+        code: 400,
+      });
+    }
 
-    console.log(user, "user");
+    // Validate language_code is a number
+    if (isNaN(Number(language_code))) {
+      return res.status(400).json({
+        success: false,
+        message: "language_code must be a valid number",
+        code: 400,
+      });
+    }
+
+    // Get user profile based on role
+    let user;
+    if (role === "user") {
+      try {
+        user = await getProfile(id);
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: "User not found",
+            code: 404,
+          });
+        }
+      } catch (error) {
+        console.error("Error fetching user profile:", error);
+        return res.status(500).json({
+          success: false,
+          message: "Failed to fetch user profile",
+          code: 500,
+        });
+      }
+    } else if (role === "admin") {
+      // Fetch admin user from database
+      try {
+        const admin = await prisma.admin.findUnique({ where: { id } });
+        if (!admin) {
+          return res.status(404).json({
+            success: false,
+            message: "Admin not found",
+            code: 404,
+          });
+        }
+        user = {
+          id: admin.id,
+          name: admin.email, // Admin uses email as name
+          email: admin.email,
+        };
+      } catch (error) {
+        console.error("Error fetching admin profile:", error);
+        return res.status(500).json({
+          success: false,
+          message: "Failed to fetch admin profile",
+          code: 500,
+        });
+      }
+    } else {
+      return res.status(403).json({
+        success: false,
+        message: "Invalid user role",
+        code: 403,
+      });
+    }
+
+    // Get client IP address (handle proxy headers)
+    const clientIp =
+      (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+      (req.headers["x-real-ip"] as string) ||
+      req.socket.remoteAddress ||
+      "127.0.0.1";
 
     const request_time = Math.floor(Date.now() / 1000);
+
+    // Get operator password from environment or use default (MD5 of "123456")
+    // Note: This should be configured per user in production
+    const operatorPassword =
+      process.env.OPERATOR_USER_PASSWORD ||
+      "$2b$10$aY7/JBI.F0cZ1kov3DuGyueK/dYCV6D/HCBOHh.Ixj5SUN0LGDuDq";
 
     const payload = {
       operator_code: OPERATOR_CODE,
       member_account: user.id.toString(),
-      password: "e10adc3949ba59abbe56e057f20f883e",
-      nickname: user.name ? user.name : user.email,
-      currency: "IDR",
+      password: operatorPassword,
+      nickname: user.name || user.email || `user_${user.id}`,
+      currency: currency.toUpperCase(), // Use provided currency, default to IDR
       game_code: game_code,
-      product_code: product_code,
+      product_code: Number(product_code),
       game_type: game_type,
-      language_code: language_code,
-      ip: "185.117.149.161", //"127.0.0.1",
+      language_code: Number(language_code),
+      ip: clientIp,
       platform: "WEB",
       sign: generateLaunchGameSign(OPERATOR_CODE, request_time, SECRET_KEY),
       request_time: request_time,
       operator_lobby_url: operator_lobby,
     };
 
+    // Make request to operator API with timeout
     const response = await axios.post(
       `${OPERATOR_URL}/api/operators/launch-game`,
       payload,
-      { headers: { "Content-Type": "application/json" } }
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 30000, // 30 second timeout
+      }
     );
 
     if (response.data.code === 200) {
@@ -341,19 +434,46 @@ router.post("/launch-game", isAuthenticated, async (req, res) => {
         success: true,
         url: response.data.url,
         message: response.data.message,
+        code: 200,
       });
     } else {
       console.error("Launch game error:", response.data);
       return res.status(400).json({
         success: false,
-        message: response.data.message,
+        message: response.data.message || "Failed to launch game",
+        code: response.data.code || 400,
       });
     }
-  } catch (err) {
-    console.error("Launch game error:", err.response.data);
+  } catch (err: any) {
+    // Improved error handling
+    console.error("Launch game error:", {
+      message: err.message,
+      response: err.response?.data,
+      status: err.response?.status,
+      code: err.code,
+    });
+
+    // Handle specific error types
+    if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
+      return res.status(504).json({
+        success: false,
+        message: "Request to game provider timed out. Please try again.",
+        code: 504,
+      });
+    }
+
+    if (err.response?.data) {
+      return res.status(err.response.status || 500).json({
+        success: false,
+        message: err.response.data.message || "Failed to launch game",
+        code: err.response.status || 500,
+      });
+    }
+
     return res.status(500).json({
       success: false,
-      message: "Internal server error",
+      message: err.message || "Internal server error",
+      code: 500,
     });
   }
 });
